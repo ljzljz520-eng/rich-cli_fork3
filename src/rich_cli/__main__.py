@@ -8,6 +8,13 @@ from rich.console import Console, RenderableType
 from rich.markup import escape
 from rich.text import Text
 
+from .terminal_safety import (
+    POLICY_SAFE,
+    POLICIES,
+    sanitize_string,
+    sanitize_to_text,
+)
+
 console = Console()
 error_console = Console(stderr=True)
 
@@ -39,6 +46,28 @@ COMMON_LEXERS = {
 
 VERSION = "1.8.0"
 
+# Pygments names/aliases for plain, un-highlighted text.  Only these renderers
+# pass embedded SGR bytes through contiguously (coloured log files); a code
+# lexer tokenizes an SGR sequence into separately styled tokens, splitting it
+# apart and leaving a stray ESC, so code lexers get SGR stripped (Pygments
+# supplies the colours).
+_PLAIN_TEXT_LEXER_NAMES = {
+    "text",
+    "text only",
+    "plain",
+    "plaintext",
+    "printer",
+    "none",
+    "",
+}
+
+
+def _lexer_keeps_sgr(lexer: Optional[str]) -> bool:
+    """Whether embedded SGR stays contiguous under this lexer."""
+    if lexer is None:
+        return True
+    return lexer.strip().lower() in _PLAIN_TEXT_LEXER_NAMES
+
 
 AUTO = 0
 SYNTAX = 1
@@ -59,7 +88,9 @@ def on_error(message: str, error: Optional[Exception] = None, code=-1) -> NoRetu
         error_text = Text(message)
         error_text.stylize("bold red")
         error_text += ": "
-        error_text += error_console.highlighter(str(error))
+        # Exception messages may quote untrusted file content.
+        safe_message = sanitize_string(str(error), POLICY_SAFE)
+        error_text += error_console.highlighter(safe_message)
         error_console.print(error_text)
     else:
         error_text = Text(message, style="bold red")
@@ -67,16 +98,44 @@ def on_error(message: str, error: Optional[Exception] = None, code=-1) -> NoRetu
     sys.exit(code)
 
 
-def read_resource(path: str, lexer: Optional[str]) -> Tuple[str, Optional[str]]:
-    """Read a resource form a file or stdin."""
+def read_resource(
+    path: str,
+    lexer: Optional[str],
+    escape_policy: str = POLICY_SAFE,
+    escape_forensics: bool = False,
+    _sanitize: bool = True,
+    drop_sgr_for_code: bool = False,
+) -> Tuple[str, Optional[str]]:
+    """Read a resource form a file or stdin.
+
+    The returned text is passed through the terminal-control sanitizer, so OSC /
+    DCS / cursor sequences embedded in untrusted files can never reach a
+    rendering backend.  Structured formats that decode escape bytes (JSON /
+    ipynb) pass ``_sanitize=False`` and filter decoded values themselves, so
+    forensic markers can never invalidate the source syntax.
+
+    ``drop_sgr_for_code`` is used by the syntax path: SGR is only kept when the
+    resolved lexer is plain text, because a code lexer would split the sequence
+    bytes into separate tokens.
+    """
     if not path:
         on_error("missing path or URL")
+
+    def filter_text(text: str, resolved_lexer: Optional[str] = None) -> str:
+        if _sanitize:
+            allow_sgr = _lexer_keeps_sgr(resolved_lexer) if drop_sgr_for_code else True
+            return sanitize_string(
+                text,
+                escape_policy,
+                escape_forensics,
+                allow_sgr=allow_sgr,
+            )
+        return text
 
     if path.startswith(("http://", "https://")):
         import requests
 
         response = requests.get(path)
-
         text = response.text
         try:
             mime_type: str = response.headers["Content-Type"]
@@ -97,10 +156,10 @@ def read_resource(path: str, lexer: Optional[str]) -> Tuple[str, Optional[str]]:
                         lexer = get_lexer_for_mimetype(mime_type).name
                     except Exception:
                         pass
-        return (text, lexer)
+        return (filter_text(text, lexer), lexer)
     try:
         if path == "-":
-            return (sys.stdin.read(), None)
+            return (filter_text(sys.stdin.read(), lexer), lexer)
 
         with open(path, "rt", encoding="utf8", errors="replace") as resource_file:
             text = resource_file.read()
@@ -115,8 +174,8 @@ def read_resource(path: str, lexer: Optional[str]) -> Tuple[str, Optional[str]]:
             try:
                 lexer = guess_lexer_for_filename(path, text).name
             except ClassNotFound:
-                return (text, "text")
-        return (text, lexer)
+                lexer = "text"
+        return (filter_text(text, lexer), lexer)
     except Exception as error:
         on_error(f"unable to read {escape(path)}", error)
 
@@ -396,6 +455,23 @@ class RichCommand(click.Command):
     "--export-svg", metavar="PATH", default="", help="Write SVG to [b]PATH[/b]."
 )
 @click.option("--pager", is_flag=True, help="Display in an interactive pager.")
+@click.option(
+    "--escape-policy",
+    metavar="POLICY",
+    type=click.Choice(POLICIES),
+    default=POLICY_SAFE,
+    envvar="RICH_ESCAPE_POLICY",
+    help=(
+        "How to handle terminal control sequences in the resource. "
+        "[b]safe[/b] keeps colours and newlines only (default); "
+        "[b]strict[/b] also strips colours; [b]raw[/b] disables filtering."
+    ),
+)
+@click.option(
+    "--escape-forensics",
+    is_flag=True,
+    help="Show stripped control sequences as visible markers (e.g. ␛[2J).",
+)
 @click.option("--version", "-v", is_flag=True, help="Print version and exit.")
 def main(
     resource: str,
@@ -441,6 +517,8 @@ def main(
     export_html: str = "",
     export_svg: str = "",
     pager: bool = False,
+    escape_policy: str = POLICY_SAFE,
+    escape_forensics: bool = False,
 ):
     """Rich toolbox for console output."""
     if version:
@@ -540,11 +618,12 @@ def main(
 
         try:
             if resource == "-":
-                renderable = Text.from_markup(
-                    sys.stdin.read(), justify=justify, emoji=emoji
+                markup_data = sanitize_string(
+                    sys.stdin.read(), escape_policy, escape_forensics
                 )
             else:
-                renderable = Text.from_markup(resource, justify=justify, emoji=emoji)
+                markup_data = sanitize_string(resource, escape_policy, escape_forensics)
+            renderable = Text.from_markup(markup_data, justify=justify, emoji=emoji)
             renderable.no_wrap = no_wrap
 
         except Exception as error:
@@ -560,31 +639,43 @@ def main(
                 on_error("unable to parse rule style", error)
 
             renderable = Rule(
-                resource,
+                sanitize_string(resource, escape_policy, escape_forensics),
                 style=render_rule_style,
                 characters=rule_char or "─",
                 align="center" if justify in ("full", "default") else justify,
             )
 
     elif resource_format == JSON:
+        import json as json_module
         from rich.json import JSON as RichJSON
 
-        json_data, _lexer = read_resource(resource, lexer)
+        json_data, _lexer = read_resource(
+            resource, lexer, escape_policy, escape_forensics, _sanitize=False
+        )
         try:
-            renderable = RichJSON(json_data)
+            # Parse first, filter afterwards: "\u001b" in JSON source only
+            # becomes a real ESC after decoding, and forensic markers injected
+            # pre-parse could invalidate the JSON syntax.
+            parsed_json = json_module.loads(json_data)
+            parsed_json = _sanitize_json_value(
+                parsed_json, escape_policy, escape_forensics
+            )
+            renderable = RichJSON.from_data(parsed_json)
         except Exception as error:
             on_error("unable to read json", error)
 
     elif resource_format == MARKDOWN:
         from .markdown import Markdown
 
-        markdown_data, lexer = read_resource(resource, lexer)
+        markdown_data, lexer = read_resource(
+            resource, lexer, escape_policy, escape_forensics
+        )
         renderable = Markdown(markdown_data, code_theme=theme, hyperlinks=hyperlinks)
 
     elif resource_format == RST:
         from rich_rst import RestructuredText
 
-        rst_data, _ = read_resource(resource, lexer)
+        rst_data, _ = read_resource(resource, lexer, escape_policy, escape_forensics)
         renderable = RestructuredText(
             rst_data,
             code_theme=theme,
@@ -607,7 +698,15 @@ def main(
 
     elif resource_format == CSV:
 
-        renderable = render_csv(resource, head, tail, title, caption)
+        renderable = render_csv(
+            resource,
+            head,
+            tail,
+            title,
+            caption,
+            escape_policy,
+            escape_forensics,
+        )
 
     elif resource_format == IPYNB:
 
@@ -621,6 +720,8 @@ def main(
             line_numbers,
             guides,
             no_wrap,
+            escape_policy,
+            escape_forensics,
         )
 
     else:
@@ -630,9 +731,23 @@ def main(
 
         try:
             if resource == "-":
-                code = sys.stdin.read()
+                # Unknown stdin content: treat as plain text and keep SGR so
+                # piped coloured logs still render; an explicit code lexer drops
+                # it to keep the sequence bytes contiguous.
+                code = sanitize_string(
+                    sys.stdin.read(),
+                    escape_policy,
+                    escape_forensics,
+                    allow_sgr=_lexer_keeps_sgr(lexer),
+                )
             else:
-                code, lexer = read_resource(resource, lexer)
+                code, lexer = read_resource(
+                    resource,
+                    lexer,
+                    escape_policy,
+                    escape_forensics,
+                    drop_sgr_for_code=True,
+                )
 
             num_lines = len(code.splitlines())
             line_range = _line_range(head, tail, num_lines)
@@ -707,7 +822,10 @@ def main(
             width = console.width
         render_options = console.options.update(width=width - 1)
         lines = console.render_lines(renderable, render_options, new_lines=True)
-        PagerApp.run(title=resource, content=PagerRenderable(lines, width=width))
+        PagerApp.run(
+            title=sanitize_string(resource, escape_policy, escape_forensics),
+            content=PagerRenderable(lines, width=width),
+        )
 
     else:
         try:
@@ -733,12 +851,37 @@ def main(
             on_error("failed to save SVG", error)
 
 
+def _sanitize_json_value(
+    value: object, escape_policy: str, escape_forensics: bool
+) -> object:
+    """Recursively sanitize every string in decoded JSON data.
+
+    JSON source may encode ESC as ``\\u001b``; the escape only becomes a real
+    control byte after decoding, so it must be filtered post-parse.
+    """
+    if isinstance(value, str):
+        return sanitize_string(value, escape_policy, escape_forensics)
+    if isinstance(value, list):
+        return [
+            _sanitize_json_value(item, escape_policy, escape_forensics)
+            for item in value
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_json_value(item, escape_policy, escape_forensics)
+            for key, item in value.items()
+        }
+    return value
+
+
 def render_csv(
     resource: str,
     head: Optional[int] = None,
     tail: Optional[int] = None,
     title: Optional[str] = None,
     caption: Optional[str] = None,
+    escape_policy: str = POLICY_SAFE,
+    escape_forensics: bool = False,
 ) -> RenderableType:
     """Render resource as CSV.
 
@@ -757,7 +900,7 @@ def render_csv(
 
     is_number = re.compile(r"\-?[0-9]*?\.?[0-9]*?").fullmatch
 
-    csv_data, _ = read_resource(resource, "csv")
+    csv_data, _ = read_resource(resource, "csv", escape_policy, escape_forensics)
     sniffer = csv.Sniffer()
     try:
         dialect = sniffer.sniff(csv_data[:1024], delimiters=",\t|;")
@@ -826,6 +969,8 @@ def render_ipynb(
     line_numbers: bool,
     guides: bool,
     no_wrap: bool,
+    escape_policy: str = POLICY_SAFE,
+    escape_forensics: bool = False,
 ) -> RenderableType:
     """Render resource as Jupyter notebook.
 
@@ -839,6 +984,8 @@ def render_ipynb(
         line_numbers (bool): Enable line number in code cells.
         guides (bool): Enable indentation guides in code cell syntax highlighting.
         no_wrap (bool): Don't word wrap syntax highlighted cells.
+        escape_policy (str): Terminal control sequence allow-list policy.
+        escape_forensics (bool): Visualise stripped control sequences.
 
     Returns:
         RenderableType: Notebook as Markdown renderable.
@@ -849,11 +996,33 @@ def render_ipynb(
     from rich.panel import Panel
     from .markdown import Markdown
 
-    notebook_str, _ = read_resource(resource, None)
+    # The raw .ipynb is JSON; control bytes may be stored there escaped
+    # ("\u001b") and only materialise after decoding, so every cell / output
+    # string is filtered below rather than sanitising the raw JSON text.
+    notebook_str, _ = read_resource(
+        resource,
+        None,
+        escape_policy,
+        escape_forensics,
+        _sanitize=False,
+    )
     notebook_dict = json.loads(notebook_str)
     lexer = lexer or notebook_dict.get("metadata", {}).get("kernelspec", {}).get(
         "language", ""
     )
+
+    def join_chunks(data: object) -> str:
+        """Join notebook chunk lists *before* parsing.
+
+        Joining first means a control sequence split across list elements cannot
+        reassemble downstream of the sanitizer.
+        """
+        if isinstance(data, list):
+            return "".join(str(part) for part in data)
+        return str(data)
+
+    def safe_text(data: object) -> str:
+        return sanitize_string(join_chunks(data), escape_policy, escape_forensics)
 
     renderable: RenderableType
     new_line = True
@@ -864,8 +1033,18 @@ def render_ipynb(
         if "execution_count" in cell:
             execution_count = cell["execution_count"] or " "
             cells.append(f"[green]In [[#66ff00]{execution_count}[/#66ff00]]:[/green]")
-        source = "".join(cell["source"])
+        # Join first, then parse: a sequence split across the source/output
+        # chunk lists must not be able to reassemble downstream.
+        raw_source = join_chunks(cell.get("source", ""))
         if cell["cell_type"] == "code":
+            # Code goes through a Pygments lexer, which would split SGR bytes
+            # into separate tokens; drop SGR (the lexer colours the code).
+            source = sanitize_string(
+                raw_source,
+                escape_policy,
+                escape_forensics,
+                allow_sgr=False,
+            )
             num_lines = len(source.splitlines())
             line_range = _line_range(head, tail, num_lines)
             renderable = Panel(
@@ -881,29 +1060,42 @@ def render_ipynb(
                 border_style="dim",
             )
         elif cell["cell_type"] == "markdown":
+            source = safe_text(raw_source)
             renderable = Markdown(source, code_theme=theme, hyperlinks=hyperlinks)
         else:
-            renderable = Text(source)
+            renderable = sanitize_to_text(
+                raw_source,
+                escape_policy,
+                escape_forensics,
+            )
         new_line = True
         cells.append(renderable)
         for output in cell.get("outputs", []):
             output_type = output["output_type"]
             if output_type == "stream":
-                renderable = Text.from_ansi("".join(output["text"]))
+                renderable = sanitize_to_text(
+                    join_chunks(output.get("text", "")),
+                    escape_policy,
+                    escape_forensics,
+                )
                 new_line = False
             elif output_type == "error":
-                renderable = Text.from_ansi("\n".join(output["traceback"]).rstrip())
+                traceback = join_chunks(output.get("traceback", []))
+                renderable = sanitize_to_text(
+                    "\n".join(traceback.splitlines()).rstrip(),
+                    escape_policy,
+                    escape_forensics,
+                )
                 new_line = True
             elif output_type == "execute_result":
                 execution_count = output.get("execution_count", " ") or " "
                 renderable = Text.from_markup(
                     f"[red]Out[[#ee4b2b]{execution_count}[/#ee4b2b]]:[/red]\n"
                 )
-                data = output["data"].get("text/plain", "")
-                if isinstance(data, list):
-                    renderable += Text.from_ansi("".join(data))
-                else:
-                    renderable += Text.from_ansi(data)
+                data = output.get("data", {}).get("text/plain", "")
+                renderable += sanitize_to_text(
+                    join_chunks(data), escape_policy, escape_forensics
+                )
                 new_line = True
             else:
                 continue
